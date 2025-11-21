@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ADS-B A/A TACAN</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #000;
+      color: #0f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 10px 0;
+      color: #8f8;
+      text-align: center;
+    }
+    #status {
+      font-size: 14px;
+      margin-bottom: 10px;
+    }
+    #range-display {
+      font-size: 72px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      margin: 20px 0 0 0;
+      text-align: center;
+    }
+    #units {
+      font-size: 24px;
+      margin-bottom: 10px;
+    }
+    #target-status {
+      font-size: 14px;
+      margin-bottom: 15px;
+      color: #8f8;
+      text-align: center;
+      min-height: 18px;
+    }
+    #target-select,
+    #tail-input,
+    #lock-button {
+      font-size: 18px;
+      padding: 6px 8px;
+      margin: 4px 0;
+      width: 100%;
+      max-width: 360px;
+      box-sizing: border-box;
+    }
+    #lock-button {
+      background-color: #060;
+      color: #cfc;
+      border: 1px solid #3c3;
+      border-radius: 4px;
+    }
+    #lock-button.locked {
+      background-color: #600;
+      border-color: #c33;
+      color: #fcc;
+    }
+    #lock-button:active {
+      filter: brightness(1.2);
+    }
+    #info {
+      font-size: 13px;
+      max-width: 380px;
+      text-align: center;
+      color: #8f8;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>ADS-B Air-to-Air TACAN</h1>
+  <div id="status">Status: <span id="status-text">Connecting…</span></div>
+
+  <div id="range-display">--.-</div>
+  <div id="units">NM</div>
+  <div id="target-status"></div>
+
+  <!-- Pre-enter or lock a specific tail / ICAO -->
+  <input id="tail-input" type="text" placeholder="Type tail or ICAO (e.g. N123AB)" autocomplete="off">
+  <button id="lock-button">Lock Typed/Selected Target</button>
+
+  <!-- Or pick from the live list -->
+  <select id="target-select">
+    <option value="">Or select from live traffic…</option>
+  </select>
+
+  <div id="info">
+    Connect your iPad to the Stratux Wi-Fi first, then open this page.
+    You can either lock a known tail/ICAO, or pick one from the live list.
+  </div>
+
+  <script>
+    const STRATUX_WS_URL = "ws://192.168.10.1/traffic";
+
+    const statusText     = document.getElementById("status-text");
+    const rangeDisplay   = document.getElementById("range-display");
+    const targetSelect   = document.getElementById("target-select");
+    const tailInput      = document.getElementById("tail-input");
+    const lockButton     = document.getElementById("lock-button");
+    const targetStatusEl = document.getElementById("target-status");
+
+    // Latest info for each target keyed by normalized ID
+    // { id, label, labelUpper, distanceMeters, lastSeenTime }
+    const targets = new Map();
+
+    let selectedId = "";          // normalized ID we want to track
+    let isLocked = false;         // true when lock toggle is on
+    let manualSelection = false;  // true when target was set via text/toggle
+
+    // Last good range (NM) for current selected target
+    let lastRangeNM = null;
+
+    const HOLD_MS = 10000;   // 10 seconds hold from last message for this target
+    const FT_PER_NM = 6076.0;
+
+    function setStatus(msg) {
+      statusText.textContent = msg;
+    }
+
+    function setTargetStatus(msg) {
+      targetStatusEl.textContent = msg || "";
+    }
+
+    function metersToNM(m) {
+      return m / 1852.0;
+    }
+
+    function normalizeId(label) {
+      return label.trim().toUpperCase();
+    }
+
+    function setRangeTextFromNM(nm) {
+      if (!Number.isFinite(nm)) {
+        rangeDisplay.textContent = "--.-";
+        return;
+      }
+
+      if (nm < 1.0) {
+        // Below 1 NM: show "feet / NM-rounded-to-nearest-250ft"
+        const feetExact = nm * FT_PER_NM;
+        const feetRounded = Math.round(feetExact / 100) * 100; // nearest 100 ft
+
+        const feet250 = Math.round(feetExact / 250) * 250;
+        const nmFrom250 = feet250 / FT_PER_NM;
+        const nmRounded = Math.round(nmFrom250 * 10) / 10; // 1 decimal
+
+        rangeDisplay.textContent =
+          `${feetRounded.toFixed(0)}/${nmRounded.toFixed(1)}`;
+      } else {
+        const nmRounded = Math.round(nm * 10) / 10;
+        rangeDisplay.textContent = nmRounded.toFixed(1);
+      }
+    }
+
+    function updateTargetDropdown() {
+      const currentValue = targetSelect.value;
+      const now = Date.now();
+
+      // Clear options except placeholder
+      while (targetSelect.options.length > 1) {
+        targetSelect.remove(1);
+      }
+
+      const allTargets = Array.from(targets.values());
+
+      // Only show targets that have updated within HOLD_MS
+      const freshTargets = allTargets.filter(t =>
+        t.lastSeenTime && (now - t.lastSeenTime) <= HOLD_MS
+      );
+
+      // Sort by distance if we have it
+      freshTargets.sort((a, b) => {
+        const da = a.distanceMeters ?? Number.POSITIVE_INFINITY;
+        const db = b.distanceMeters ?? Number.POSITIVE_INFINITY;
+        return da - db;
+      });
+
+      for (const t of freshTargets) {
+        let nmText = "–";
+        if (t.distanceMeters != null) {
+          const nm = metersToNM(t.distanceMeters);
+          nmText = (Math.round(nm * 10) / 10).toFixed(1) + " NM";
+        }
+        const opt = document.createElement("option");
+        opt.value = t.id;
+        opt.textContent = `${t.label} (${nmText})`;
+        targetSelect.appendChild(opt);
+      }
+
+      // Maintain selection only if it's still in the fresh list and we're not manually locked
+      const stillFresh = freshTargets.some(t => t.id === currentValue);
+
+      if (!manualSelection && currentValue && stillFresh) {
+        targetSelect.value = currentValue;
+      } else if (!selectedId && freshTargets.length > 0) {
+        selectedId = freshTargets[0].id;
+        targetSelect.value = selectedId;
+      } else if (!stillFresh && !isLocked) {
+        // If previously selected target is no longer fresh and we're not locked,
+        // clear dropdown selection (but keep selectedId for hold logic)
+        targetSelect.value = "";
+      }
+    }
+
+    function findBestMatchForSelectedId() {
+      if (!selectedId) return null;
+
+      if (targets.has(selectedId)) {
+        return targets.get(selectedId);
+      }
+
+      const partial = selectedId;
+      for (const t of targets.values()) {
+        if (t.labelUpper.includes(partial)) {
+          return t;
+        }
+      }
+      return null;
+    }
+
+    function updateRangeDisplay() {
+      const now = Date.now();
+
+      if (!selectedId) {
+        rangeDisplay.textContent = "--.-";
+        setTargetStatus("");
+        lastRangeNM = null;
+        return;
+      }
+
+      const t = findBestMatchForSelectedId();
+
+      if (!t || !t.lastSeenTime) {
+        // No record of target at all
+        rangeDisplay.textContent = "--.-";
+        setTargetStatus("Target not currently visible.");
+        lastRangeNM = null;
+        return;
+      }
+
+      const age = now - t.lastSeenTime;
+
+      if (age <= HOLD_MS) {
+        // Fresh-ish message for this target
+        if (t.distanceMeters != null) {
+          const nm = metersToNM(t.distanceMeters);
+          lastRangeNM = nm;
+          setRangeTextFromNM(nm);
+          setTargetStatus(`Tracking: ${t.label}`);
+          return;
+        } else if (lastRangeNM != null) {
+          // Have no new distance, but we have a stored last good range
+          setRangeTextFromNM(lastRangeNM);
+          setTargetStatus("Holding last range (link glitch < 10s)");
+          return;
+        } else {
+          rangeDisplay.textContent = "--.-";
+          setTargetStatus("No distance data for target.");
+          return;
+        }
+      }
+
+      // Older than HOLD_MS: consider the target effectively gone
+      rangeDisplay.textContent = "--.-";
+      setTargetStatus("Target not currently visible.");
+      lastRangeNM = null;
+    }
+
+    function processMessage(msgText) {
+      let jsonText = msgText.trim();
+      const idx = jsonText.indexOf("{");
+      if (idx > 0) {
+        jsonText = jsonText.slice(idx);
+      }
+
+      let data;
+      try {
+        data = JSON.parse(jsonText);
+      } catch (e) {
+        console.warn("Bad JSON from Stratux:", msgText);
+        return;
+      }
+
+      const now = Date.now();
+
+      let label = data.Tail && data.Tail.trim();
+      if (!label || label.length === 0) {
+        if (typeof data.Icao_addr === "number") {
+          label = "ICAO " + data.Icao_addr.toString(16).toUpperCase();
+        } else {
+          return;
+        }
+      }
+
+      const id = normalizeId(label);
+      const labelUpper = id;
+
+      let distanceMeters = null;
+      if (data.Position_valid !== false && typeof data.Distance === "number") {
+        distanceMeters = data.Distance;
+      }
+
+      targets.set(id, {
+        id,
+        label,
+        labelUpper,
+        distanceMeters,
+        lastSeenTime: now
+      });
+
+      updateTargetDropdown();
+      updateRangeDisplay();
+    }
+
+    function startWebSocket() {
+      setStatus("Connecting to Stratux…");
+      const ws = new WebSocket(STRATUX_WS_URL);
+
+      ws.onopen = () => {
+        setStatus("Connected to Stratux traffic.");
+      };
+
+      ws.onmessage = (event) => {
+        processMessage(event.data);
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        setStatus("Error – check Stratux connection.");
+      };
+
+      ws.onclose = () => {
+        setStatus("Disconnected – retrying in 3 seconds…");
+        setTimeout(startWebSocket, 3000);
+      };
+    }
+
+    // Dropdown selection handler
+    targetSelect.addEventListener("change", () => {
+      if (isLocked) {
+        targetSelect.value = selectedId || "";
+        setTargetStatus("Target is locked. Unlock to change selection.");
+        return;
+      }
+
+      const val = targetSelect.value;
+      if (val) {
+        selectedId = val;
+        manualSelection = false;
+        lastRangeNM = null;
+      } else {
+        selectedId = "";
+        lastRangeNM = null;
+      }
+      updateRangeDisplay();
+    });
+
+    // Lock button toggle
+    lockButton.addEventListener("click", () => {
+      if (!isLocked) {
+        // Locking: prefer typed tail, else currently selected from dropdown
+        let typed = tailInput.value.trim();
+        let lockId = "";
+
+        if (typed) {
+          lockId = normalizeId(typed);
+        } else if (targetSelect.value) {
+          lockId = targetSelect.value;
+          tailInput.value = targets.get(lockId)?.label || lockId;
+        } else {
+          setTargetStatus("Type a tail/ICAO or select from list before locking.");
+          return;
+        }
+
+        selectedId = lockId;
+        manualSelection = true;
+        isLocked = true;
+        lastRangeNM = null;
+
+        lockButton.textContent = "Unlock Target";
+        lockButton.classList.add("locked");
+        targetSelect.value = "";
+
+        setTargetStatus(`Locked to: ${selectedId}`);
+        updateRangeDisplay();
+      } else {
+        // Unlocking
+        isLocked = false;
+        manualSelection = false;
+        lockButton.textContent = "Lock Typed/Selected Target";
+        lockButton.classList.remove("locked");
+        setTargetStatus("Target unlocked. Select from list or lock again.");
+        updateRangeDisplay();
+      }
+    });
+
+    // Enter key in text box acts like clicking lock
+    tailInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        lockButton.click();
+      }
+    });
+
+    window.addEventListener("load", () => {
+      startWebSocket();
+      // Periodic tick: enforce the 10-second hold AND declutter the list
+      setInterval(() => {
+        updateTargetDropdown();
+        updateRangeDisplay();
+      }, 1000);
+    });
+  </script>
+</body>
+</html>
